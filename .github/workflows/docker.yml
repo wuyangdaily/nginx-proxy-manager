@@ -1,0 +1,103 @@
+name: Docker Image CI
+
+on:
+  workflow_dispatch:
+  create:
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    environment: Docker
+
+    steps:
+    # 1️⃣ 拉取代码
+    - uses: actions/checkout@v4
+
+    # 2️⃣ 读取版本号
+    - name: Read version
+      id: version
+      run: |
+        BUILD_VERSION=$(cat .version)
+        echo "BUILD_VERSION=$BUILD_VERSION" >> "$GITHUB_ENV"
+        echo "version=$BUILD_VERSION" >> "$GITHUB_OUTPUT"
+
+    # 3️⃣ 安装 Node
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+        cache: 'yarn'
+        cache-dependency-path: frontend/yarn.lock
+
+    # 4️⃣ 修改版本号
+    - name: Update package version
+      run: |
+        sed -i "s/\"version\": \".*\"/\"version\": \"$BUILD_VERSION\"/" frontend/package.json
+        sed -i "s/\"version\": \".*\"/\"version\": \"$BUILD_VERSION\"/" backend/package.json
+        grep '"version"' frontend/package.json
+
+    # 5️⃣ 安装依赖
+    - name: Install frontend deps
+      working-directory: frontend
+      run: yarn install --frozen-lockfile
+
+    # 6️⃣ 编译 locale
+    - name: Build frontend
+      working-directory: frontend
+      run: |
+        yarn locale-compile
+        yarn build
+
+    # 7️⃣ QEMU
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+      with:
+        platforms: amd64,arm64
+
+    # 8️⃣ Buildx
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    # 9️⃣ 登录 Docker Hub
+    - name: Docker Login
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+
+    # 🔟 构建并推送镜像
+    - name: Build and Push Docker Image
+      run: |
+        IMAGE_BASE="${{ secrets.DOCKER_USERNAME }}/nginx-proxy-manager"
+
+        TAGS=()
+        BUILD_VER="$BUILD_VERSION"
+        if [ -n "$BUILD_VER" ]; then
+          TAGS+=("-t" "${IMAGE_BASE}:${BUILD_VER}")
+        fi
+
+        if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+          TAGS+=("-t" "${IMAGE_BASE}:latest")
+          echo "Manual trigger: forcing 'latest' tag"
+        elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+          TAG_NAME="${GITHUB_REF##*/}"
+          TAGS+=("-t" "${IMAGE_BASE}:${TAG_NAME}")
+        elif [[ "${GITHUB_REF_NAME}" == "main" ]] || [[ "${GITHUB_REF_NAME}" == "master" ]]; then
+          TAGS+=("-t" "${IMAGE_BASE}:latest")
+        else
+          echo "Skipping 'latest' tag for non-main branch: ${GITHUB_REF_NAME}"
+        fi
+
+        echo "Building and pushing with tags: ${TAGS[@]}"
+
+        docker buildx build \
+          --platform linux/amd64,linux/arm64 \
+          --build-arg BUILD_VERSION="$BUILD_VER" \
+          "${TAGS[@]}" \
+          -f docker/Dockerfile \
+          --push .
+
+    # 1️⃣1️⃣ 登出 Docker Hub
+    - name: Docker Logout
+      if: always()
+      run: docker logout
